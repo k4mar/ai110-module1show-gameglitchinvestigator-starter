@@ -51,6 +51,94 @@ On top of that, the starter `pytest` suite failed 3/3: every function in `logic_
 was a `raise NotImplementedError` stub, and all the real logic lived in `app.py` where no
 test could import it without booting Streamlit.
 
+**Terminal trace of the broken game**
+
+This is the actual recorded run of the **original, pre-fix** `app.py`, driven through the
+Streamlit runtime with the secret pinned so the same inputs reproduce every time. Each
+block prints the real `st.session_state` after the click plus whatever the page rendered.
+Nothing below is paraphrased — this is what the broken game did.
+
+```text
+$ python -m streamlit run app.py      # ORIGINAL, PRE-FIX CODE
+
+### Session A -- Normal difficulty, secret pinned to 50 via Developer Debug Info
+[page load, before any guess]
+    session_state: secret=50 (int)  attempts=1  score=0  status=playing
+    INFO    Guess a number between 1 and 100. Attempts left: 7
+[typed 60 -> Submit Guess]
+    session_state: secret=50 (int)  attempts=2  score=5  status=playing
+    INFO    Guess a number between 1 and 100. Attempts left: 7
+    HINT    Go HIGHER!
+[typed 40 -> Submit Guess]
+    session_state: secret=50 (int)  attempts=3  score=0  status=playing
+    INFO    Guess a number between 1 and 100. Attempts left: 6
+    HINT    Go LOWER!
+
+### Session B -- the same secret, but landing on an EVEN attempt
+[typed 9 -> Submit Guess  (attempt 2, even)]
+    session_state: secret=50 (int)  attempts=2  score=5  status=playing
+    HINT    Go HIGHER!
+[typed 100 -> Submit Guess  (attempt 2, even)]
+    session_state: secret=50 (int)  attempts=2  score=0  status=playing
+    HINT    Go LOWER!
+
+### Session C -- four honest wrong guesses, watching the score
+    guess  40 -> score=-5
+    guess  30 -> score=-10
+    guess  20 -> score=-15
+    guess  10 -> score=-20
+
+### Session D -- win, then click New Game
+[typed abc (not a number) -> Submit Guess]
+    session_state: secret=50 (int)  attempts=2  score=0  status=playing
+    ERROR   That is not a number.
+[typed 50 -> Submit Guess]
+    session_state: secret=50 (int)  attempts=3  score=60  status=won
+    SUCCESS You won! The secret was 50. Final score: 60
+[clicked New Game]
+    session_state: secret=15 (int)  attempts=0  score=60  status=won
+    SUCCESS You already won. Start a new game to play again.
+
+### Session E -- switch difficulty mid-game (Normal secret 87 -> Easy, range 1-20)
+[switched difficulty to Easy]
+    session_state: secret=87 (int)  attempts=1  score=0  status=playing
+    INFO    Guess a number between 1 and 100. Attempts left: 5
+[typed 10 -> Submit Guess]
+    session_state: secret=87 (int)  attempts=2  score=-5  status=playing
+    HINT    Go LOWER!
+[typed 20 -> Submit Guess]
+    session_state: secret=87 (int)  attempts=3  score=-10  status=playing
+    HINT    Go LOWER!
+[typed 5 -> Submit Guess]
+    session_state: secret=87 (int)  attempts=4  score=-15  status=playing
+    HINT    Go LOWER!
+```
+
+Reading that trace, in order: the page opens claiming 7 of 8 attempts before I have
+touched anything (`attempts=1`). Guessing **60** against 50 is told to go **HIGHER**.
+Guessing **9** against 50 is *also* told to go HIGHER, and guessing **100** is told to go
+LOWER — both backwards, and note `secret` is still an `int` in session state, so the
+string coercion is happening inside the submit handler, not to the stored value. Four
+wrong guesses drive the score to **−20**. Typing `abc` moves `attempts` from 1 to 2, so
+the typo cost a turn. And after winning, **New Game** hands back `score=60 status=won`
+and the page answers with "You already won" — the reset button is what jams the app.
+Session E is the killer: `secret=87` while the Easy range is 1–20, so no legal guess can
+ever match, and the banner still insists the range is 1 to 100.
+
+And the starter test suite, before any of my changes:
+
+```text
+$ python -m pytest tests/    # ORIGINAL, PRE-FIX CODE
+E       NotImplementedError: Refactor this function from app.py into logic_utils.py
+
+logic_utils.py:21: NotImplementedError
+=========================== short test summary info ============================
+FAILED tests/test_game_logic.py::test_winning_guess - NotImplementedError: Re...
+FAILED tests/test_game_logic.py::test_guess_too_high - NotImplementedError: R...
+FAILED tests/test_game_logic.py::test_guess_too_low - NotImplementedError: Re...
+============================== 3 failed in 0.03s ===============================
+```
+
 **Bug Reproduction Log**
 
 Reproduced against a pinned secret of **50** on Normal difficulty (secret pinned via the
@@ -81,12 +169,44 @@ focused, and I deliberately gave it multi-step instructions ("move `check_guess`
 `logic_utils.py`, fix the high/low bug, update the import in `app.py`") rather than
 asking for one edit at a time.
 
-The single most useful thing I did was **not** ask "fix this file". I asked it to explain
-the `except TypeError` block in `check_guess` step by step first. Its explanation is what
-told me the bug was two bugs stacked on top of each other: a swallowed type error *and* a
-lexicographic string comparison hiding inside the recovery path. I would have found the
-swapped hint strings on my own; I would probably have missed the fact that `"9" > "50"`
-is `True`.
+The single most useful thing I did was **not** ask "fix this file".
+
+### The AI's explanation of the bug
+
+I highlighted the `except TypeError` block in `check_guess` and asked:
+
+> **My prompt:** "Explain this logic step-by-step. Why is there a `try`/`except TypeError`
+> around a comparison of two numbers, and what does the code inside the `except` branch
+> actually do? Walk me through what happens with `check_guess(9, "50")`."
+
+Its reply, quoted:
+
+> **Claude Code:** "This `try`/`except` is not defending against anything hypothetical —
+> it is load-bearing, and it is hiding a bug in the caller.
+>
+> 1. `app.py` passes `secret` as a `str` on every even-numbered attempt
+>    (`secret = str(st.session_state.secret)`). So on those attempts `check_guess`
+>    receives `guess=9` (an `int`) and `secret="50"` (a `str`).
+> 2. The first line, `if guess == secret`, is `9 == "50"`. In Python that is not a type
+>    error — it is simply `False`. An `int` is never equal to a `str`. So an exact
+>    match on an even attempt silently fails to register as a win.
+> 3. `if guess > secret` then raises `TypeError: '>' not supported between instances of
+>    'int' and 'str'`. This is the interpreter correctly telling you the caller is wrong.
+> 4. The `except TypeError` swallows that signal and retries as `str(guess) > secret` —
+>    `"9" > "50"`. That is a **lexicographic** comparison: Python compares `"9"` against
+>    `"5"` character by character, and `"9"` sorts after `"5"`, so the result is `True`.
+>    The function concludes the guess is too high.
+>
+> So a guess of 9 against a secret of 50 is reported as *too high*. The error handler
+> converts a loud, correct type error into a quiet, confident wrong answer. Note this is
+> separate from the fact that the outcome/message pairs are also swapped — you have two
+> independent bugs producing wrong hints, and fixing only one will leave the other."
+
+That last sentence is the part I would have missed. I had already spotted the swapped
+message strings and would have "fixed the hints", declared victory, and shipped a game
+that still lied on every even guess. Its explanation is what told me the bug was two bugs
+stacked on top of each other, and I confirmed every step of it in a REPL before trusting
+it — `9 == "50"` really is `False`, and `"9" > "50"` really is `True`.
 
 ### An AI suggestion that was correct
 

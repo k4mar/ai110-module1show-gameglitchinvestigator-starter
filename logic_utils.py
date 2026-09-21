@@ -46,10 +46,15 @@ DEFAULT_DIFFICULTY = "Normal"
 
 
 def get_range_for_difficulty(difficulty: str):
-    """Return the (low, high) inclusive guessing range for a difficulty.
+    """Return the inclusive guessing range for a difficulty.
 
-    Unknown difficulties fall back to Normal rather than raising, because the
-    value arrives from a UI widget and a crash there would take the page down.
+    Args:
+        difficulty: A key of :data:`DIFFICULTIES`, e.g. ``"Easy"``. Unknown
+            values fall back to Normal rather than raising, because this value
+            arrives from a UI widget and a crash there would take the page down.
+
+    Returns:
+        A ``(low, high)`` tuple of inclusive bounds.
     """
     low, high, _attempts = DIFFICULTIES.get(
         difficulty, DIFFICULTIES[DEFAULT_DIFFICULTY]
@@ -59,6 +64,13 @@ def get_range_for_difficulty(difficulty: str):
 
 def get_attempt_limit(difficulty: str) -> int:
     """Return how many guesses a difficulty allows.
+
+    Args:
+        difficulty: A key of :data:`DIFFICULTIES`. Unknown values fall back to
+            Normal, matching :func:`get_range_for_difficulty`.
+
+    Returns:
+        The number of attempts allowed at that difficulty.
 
     # FIX: this lived as a bare `attempt_limit_map` dict inside app.py, one
     # screen away from get_range_for_difficulty, so the range and the attempt
@@ -71,7 +83,16 @@ def get_attempt_limit(difficulty: str) -> int:
 
 
 def minimum_attempts_needed(low: int, high: int) -> int:
-    """Guesses a perfect binary search needs to pin any number in [low, high]."""
+    """Return the guesses a perfect binary search needs over a range.
+
+    Args:
+        low: Inclusive lower bound.
+        high: Inclusive upper bound.
+
+    Returns:
+        ``ceil(log2(n))`` for a range of ``n`` possibilities, and 1 for a range
+        with a single value (where the log would be 0).
+    """
     possibilities = high - low + 1
     if possibilities <= 1:
         return 1
@@ -81,8 +102,15 @@ def minimum_attempts_needed(low: int, high: int) -> int:
 def parse_guess(raw, low=None, high=None):
     """Parse raw text input into an integer guess.
 
-    Returns ``(ok, guess_int, error_message)``. When ``low`` and ``high`` are
-    supplied, guesses outside the range are rejected with an explanation.
+    Args:
+        raw: The text the player typed. ``None`` and blank input are handled.
+        low: Optional inclusive lower bound to range-check against.
+        high: Optional inclusive upper bound to range-check against.
+
+    Returns:
+        A ``(ok, guess_int, error_message)`` tuple. On success that is
+        ``(True, <int>, None)``; on failure ``(False, None, "<why>")``, where
+        the message is written for the player rather than the developer.
 
     # FIX: the original accepted "3.9" and silently truncated it to 3 via
     # int(float(raw)), so the game scored you against a number you never
@@ -152,8 +180,17 @@ def _to_int(value, name):
 def check_guess(guess, secret):
     """Compare a guess to the secret and return the outcome.
 
-    Returns one of the ``WIN`` / ``TOO_HIGH`` / ``TOO_LOW`` constants. Use
-    :func:`hint_message` to turn an outcome into player-facing text.
+    Args:
+        guess: The player's guess. Numeric strings are accepted and coerced.
+        secret: The number being guessed, same rules.
+
+    Returns:
+        One of the :data:`WIN`, :data:`TOO_HIGH` or :data:`TOO_LOW` constants.
+        Use :func:`hint_message` to turn an outcome into player-facing text.
+
+    Raises:
+        TypeError: If either argument is not numeric. Failing loudly is
+            deliberate -- see :func:`_to_int`.
 
     # FIX: this used to return an (outcome, message) tuple, which mixed the
     # rule with its presentation and let them disagree -- TOO_HIGH shipped
@@ -172,7 +209,14 @@ def check_guess(guess, secret):
 
 
 def hint_message(outcome: str) -> str:
-    """Player-facing hint for an outcome.
+    """Return the player-facing hint for an outcome.
+
+    Args:
+        outcome: One of the :data:`WIN`, :data:`TOO_HIGH` or :data:`TOO_LOW`
+            constants.
+
+    Returns:
+        A short emoji-prefixed message, or ``""`` for an unrecognised outcome.
 
     # FIX: the advice is now looked up from the outcome, so "Too High" can only
     # ever tell the player to go LOWER. This is the actual inverted-hint fix.
@@ -187,8 +231,15 @@ def hint_message(outcome: str) -> str:
 def update_score(current_score: int, outcome: str, attempt_number: int) -> int:
     """Return the new score after one guess.
 
-    ``attempt_number`` is the 1-based number of the attempt just played, so a
-    win on the very first guess is worth the full ``MAX_WIN_POINTS``.
+    Args:
+        current_score: The score before this guess.
+        outcome: One of the :data:`WIN`, :data:`TOO_HIGH` or :data:`TOO_LOW`
+            constants. Anything else leaves the score untouched.
+        attempt_number: The 1-based number of the attempt just played, so a win
+            on the very first guess is worth the full :data:`MAX_WIN_POINTS`.
+
+    Returns:
+        The updated score, never below zero.
 
     # FIX: three bugs here.
     # 1. "Too High" paid +5 on even attempts and -5 on odd ones, so the reward
