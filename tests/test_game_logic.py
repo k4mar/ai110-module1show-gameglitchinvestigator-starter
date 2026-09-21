@@ -21,29 +21,36 @@ from logic_utils import (
     TOO_HIGH,
     TOO_LOW,
     WIN,
+    build_session_table,
     check_guess,
+    format_high_scores,
     get_attempt_limit,
     get_range_for_difficulty,
     hint_message,
     minimum_attempts_needed,
     parse_guess,
+    proximity_label,
+    proximity_trend,
+    update_high_scores,
     update_score,
 )
-
 
 # --------------------------------------------------------------------------
 # Starter tests (unchanged)
 # --------------------------------------------------------------------------
+
 
 def test_winning_guess():
     # If the secret is 50 and guess is 50, it should be a win
     result = check_guess(50, 50)
     assert result == "Win"
 
+
 def test_guess_too_high():
     # If secret is 50 and guess is 60, hint should be "Too High"
     result = check_guess(60, 50)
     assert result == "Too High"
+
 
 def test_guess_too_low():
     # If secret is 50 and guess is 40, hint should be "Too Low"
@@ -54,6 +61,7 @@ def test_guess_too_low():
 # --------------------------------------------------------------------------
 # Regression tests: one per bug in the Bug Reproduction Log
 # --------------------------------------------------------------------------
+
 
 # Bug 1 -- the hints were backwards. The old code returned
 # ("Too High", "Go HIGHER!"), telling the player to move further away from the
@@ -82,7 +90,7 @@ def test_win_hint_is_congratulations_not_a_direction():
 @pytest.mark.parametrize(
     "guess, secret, expected",
     [
-        (9, "50", TOO_LOW),     # was TOO_HIGH:  "9" sorts after "50"
+        (9, "50", TOO_LOW),  # was TOO_HIGH:  "9" sorts after "50"
         (100, "50", TOO_HIGH),  # was TOO_LOW:   "100" sorts before "50"
         (9, 50, TOO_LOW),
         (100, 50, TOO_HIGH),
@@ -192,7 +200,9 @@ def test_binary_search_actually_wins_every_secret_in_range(difficulty):
         lo, hi, attempts = low, high, 0
         while True:
             attempts += 1
-            assert attempts <= limit, f"{difficulty}: secret {secret} not found in {limit}"
+            assert (
+                attempts <= limit
+            ), f"{difficulty}: secret {secret} not found in {limit}"
             guess = (lo + hi) // 2
             outcome = check_guess(guess, secret)
             if outcome == WIN:
@@ -288,6 +298,7 @@ def test_guesses_on_and_inside_the_range_boundaries_are_accepted(raw):
 # Helper sanity checks
 # --------------------------------------------------------------------------
 
+
 @pytest.mark.parametrize(
     "low, high, expected",
     [(1, 1, 1), (1, 2, 1), (1, 8, 3), (1, 20, 5), (1, 100, 7), (1, 200, 8)],
@@ -298,6 +309,178 @@ def test_minimum_attempts_needed(low, high, expected):
 
 def test_minimum_attempts_matches_log2_for_every_difficulty():
     for difficulty, (low, high, _attempts) in DIFFICULTIES.items():
-        assert minimum_attempts_needed(low, high) == math.ceil(math.log2(high - low + 1)), (
-            difficulty
-        )
+        assert minimum_attempts_needed(low, high) == math.ceil(
+            math.log2(high - low + 1)
+        ), difficulty
+
+
+# --------------------------------------------------------------------------
+# Stretch feature: Hot/Cold proximity feedback (Enhanced Game UI)
+# --------------------------------------------------------------------------
+
+
+def test_exact_guess_is_a_bullseye():
+    assert proximity_label(50, 50, 1, 100) == "🎯 Bullseye"
+
+
+def test_proximity_gets_colder_as_the_guess_moves_away():
+    # Secret 50 in a 1-100 range, so the span used for normalising is 99.
+    # Distances: 0, 2 (0.020), 10 (0.101), 25 (0.253), 49 (0.495).
+    labels = [proximity_label(g, 50, 1, 100) for g in (50, 52, 60, 75, 99)]
+    assert labels == [
+        "🎯 Bullseye",
+        "🔥 Blazing hot",
+        "♨️ Hot",
+        "🌤️ Warm",
+        "🧊 Cold",
+    ]
+
+
+def test_the_coldest_band_is_reachable():
+    # Nothing in a 1-100 game is more than 0.495 of the span from a secret of
+    # 50, so "Freezing" can only show up when the secret is near an edge.
+    assert proximity_label(100, 1, 1, 100) == "❄️ Freezing"
+    assert proximity_label(1, 100, 1, 100) == "❄️ Freezing"
+
+
+def test_every_band_is_reachable_for_some_guess():
+    """No band should be dead code -- each one must be produceable."""
+    seen = {proximity_label(g, 50, 1, 100) for g in range(1, 101)}
+    seen |= {proximity_label(g, 1, 1, 100) for g in range(1, 101)}
+    assert seen == {
+        "🎯 Bullseye",
+        "🔥 Blazing hot",
+        "♨️ Hot",
+        "🌤️ Warm",
+        "🧊 Cold",
+        "❄️ Freezing",
+    }
+
+
+def test_proximity_is_symmetric_above_and_below_the_secret():
+    assert proximity_label(40, 50, 1, 100) == proximity_label(60, 50, 1, 100)
+
+
+def test_proximity_is_relative_to_the_difficulty_range():
+    """The same absolute distance means different things at different sizes.
+
+    Being 10 away is most of the board on Easy (1-20) but a near miss on
+    Hard (1-200). Normalising against the range is what makes the label
+    match the player's intuition.
+    """
+    on_easy = proximity_label(14, 5, 1, 20)  # 9 away out of 19 -> 0.474
+    on_hard = proximity_label(109, 100, 1, 200)  # 9 away out of 199 -> 0.045
+    assert on_easy == "🧊 Cold"
+    assert on_hard == "🔥 Blazing hot"
+
+
+def test_proximity_does_not_divide_by_zero_on_a_degenerate_range():
+    # A range where low == high would make the span 0.
+    assert proximity_label(5, 5, 5, 5) == "🎯 Bullseye"
+
+
+@pytest.mark.parametrize(
+    "previous, guess, expected",
+    [
+        (None, 40, ""),  # first guess of a round has nothing to compare to
+        (20, 40, "warmer"),  # 30 away -> 10 away
+        (45, 20, "colder"),  # 5 away -> 30 away
+        (40, 60, "same"),  # 10 away both times, opposite sides
+    ],
+)
+def test_proximity_trend(previous, guess, expected):
+    assert proximity_trend(previous, guess, secret=50) == expected
+
+
+def test_session_table_has_one_row_per_guess_in_play_order():
+    rows = build_session_table([60, 40, 50], secret=50, low=1, high=100)
+    assert [row["#"] for row in rows] == [1, 2, 3]
+    assert [row["Guess"] for row in rows] == [60, 40, 50]
+    assert [row["Result"] for row in rows] == [TOO_HIGH, TOO_LOW, WIN]
+    assert [row["Off by"] for row in rows] == [10, 10, 0]
+    assert rows[-1]["Proximity"] == "🎯 Bullseye"
+
+
+def test_session_table_is_empty_for_a_round_with_no_guesses():
+    assert build_session_table([], secret=50, low=1, high=100) == []
+
+
+# --------------------------------------------------------------------------
+# Stretch feature: High score tracking (Feature Expansion via Agent Mode)
+# --------------------------------------------------------------------------
+
+
+def test_first_result_always_sets_the_record():
+    assert update_high_scores({}, "Normal", score=80, attempts=3) == {
+        "Normal": {"score": 80, "attempts": 3}
+    }
+
+
+def test_a_higher_score_replaces_the_record():
+    existing = {"Normal": {"score": 80, "attempts": 3}}
+    assert update_high_scores(existing, "Normal", 90, 2)["Normal"] == {
+        "score": 90,
+        "attempts": 2,
+    }
+
+
+def test_a_lower_score_does_not_replace_the_record():
+    existing = {"Normal": {"score": 90, "attempts": 2}}
+    assert update_high_scores(existing, "Normal", 50, 1)["Normal"] == {
+        "score": 90,
+        "attempts": 2,
+    }
+
+
+def test_an_equal_score_in_fewer_attempts_wins_the_tie():
+    existing = {"Normal": {"score": 90, "attempts": 4}}
+    assert update_high_scores(existing, "Normal", 90, 2)["Normal"]["attempts"] == 2
+
+
+def test_an_equal_score_in_more_attempts_does_not_win_the_tie():
+    existing = {"Normal": {"score": 90, "attempts": 2}}
+    assert update_high_scores(existing, "Normal", 90, 5)["Normal"]["attempts"] == 2
+
+
+def test_each_difficulty_keeps_its_own_record():
+    scores = update_high_scores({}, "Easy", 100, 1)
+    scores = update_high_scores(scores, "Hard", 60, 5)
+    assert set(scores) == {"Easy", "Hard"}
+    assert scores["Easy"]["score"] == 100
+    assert scores["Hard"]["score"] == 60
+
+
+def test_update_high_scores_does_not_mutate_its_input():
+    """Purity matters here: this dict lives in Streamlit's session state.
+
+    Mutating it in place would make the "is this a new record?" check in
+    app.py compare an object against itself and never fire.
+    """
+    original = {"Normal": {"score": 80, "attempts": 3}}
+    snapshot = {"Normal": {"score": 80, "attempts": 3}}
+    update_high_scores(original, "Normal", 100, 1)
+    assert original == snapshot
+
+
+def test_update_high_scores_tolerates_none():
+    assert update_high_scores(None, "Easy", 70, 2) == {
+        "Easy": {"score": 70, "attempts": 2}
+    }
+
+
+def test_high_scores_are_formatted_best_first():
+    scores = {
+        "Easy": {"score": 70, "attempts": 3},
+        "Normal": {"score": 100, "attempts": 1},
+        "Hard": {"score": 90, "attempts": 2},
+    }
+    assert [row["Difficulty"] for row in format_high_scores(scores)] == [
+        "Normal",
+        "Hard",
+        "Easy",
+    ]
+
+
+def test_formatting_an_empty_high_score_table_gives_no_rows():
+    assert format_high_scores({}) == []
+    assert format_high_scores(None) == []

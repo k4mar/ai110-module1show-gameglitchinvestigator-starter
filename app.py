@@ -18,11 +18,16 @@ from logic_utils import (
     TOO_HIGH,
     TOO_LOW,
     WIN,
+    build_session_table,
     check_guess,
+    format_high_scores,
     get_attempt_limit,
     get_range_for_difficulty,
     hint_message,
     parse_guess,
+    proximity_label,
+    proximity_trend,
+    update_high_scores,
     update_score,
 )
 
@@ -66,10 +71,18 @@ def start_new_game(active_difficulty: str) -> None:
     st.session_state.status = "playing"
     st.session_state.history = []
     st.session_state.difficulty = active_difficulty
+    # NOTE: `high_scores` is deliberately NOT reset here. It is the one piece of
+    # state that outlives a round -- resetting it would defeat the whole point
+    # of a high-score table. See init below.
 
 
 if "status" not in st.session_state:
     start_new_game(difficulty)
+
+# Survives New Game and difficulty changes; only ever cleared by the explicit
+# "Reset high scores" button in the sidebar.
+if "high_scores" not in st.session_state:
+    st.session_state.high_scores = {}
 
 # # FIX: the secret used to be generated once inside `if "secret" not in
 # st.session_state` and never reseeded. Switching from Normal to Easy narrowed
@@ -112,6 +125,47 @@ def render_status() -> None:
             st.write("Difficulty:", difficulty)
             st.write("Status:", st.session_state.status)
             st.write("History:", st.session_state.history)
+            st.write("High scores:", st.session_state.high_scores)
+
+
+def render_sidebar_history() -> None:
+    """Render the Guess History panel in the sidebar.
+
+    Newest guess first, each row annotated with its Hot/Cold proximity so the
+    player can see themselves closing in rather than having to remember.
+    """
+    st.sidebar.divider()
+    st.sidebar.subheader("📜 Guess History")
+
+    if not st.session_state.history:
+        st.sidebar.caption("No guesses yet this round.")
+        return
+
+    secret = st.session_state.secret
+    for number, guess in reversed(list(enumerate(st.session_state.history, start=1))):
+        outcome = check_guess(guess, secret)
+        arrow = {WIN: "🎯", TOO_HIGH: "⬇️", TOO_LOW: "⬆️"}[outcome]
+        st.sidebar.write(
+            f"{arrow} **{guess}** — {proximity_label(guess, secret, low, high)}"
+            f"  \n<small>guess {number} · {outcome}</small>",
+            unsafe_allow_html=True,
+        )
+
+
+def render_sidebar_high_scores() -> None:
+    """Render the persistent High Scores table in the sidebar."""
+    st.sidebar.divider()
+    st.sidebar.subheader("🏆 High Scores")
+
+    rows = format_high_scores(st.session_state.high_scores)
+    if not rows:
+        st.sidebar.caption("Win a round to set a record.")
+        return
+
+    st.sidebar.table(rows)
+    if st.sidebar.button("Reset high scores"):
+        st.session_state.high_scores = {}
+        st.rerun()
 
 
 raw_guess = st.text_input("Enter your guess:", key=f"guess_input_{difficulty}")
@@ -129,6 +183,19 @@ if new_game:
     st.success("New game started.")
     st.rerun()
 
+
+def render_round_summary() -> None:
+    """Show a per-guess summary table once the round is over."""
+    if not st.session_state.history:
+        return
+    st.subheader("📊 Round summary")
+    st.table(
+        build_session_table(
+            st.session_state.history, st.session_state.secret, low, high
+        )
+    )
+
+
 if st.session_state.status != "playing":
     if st.session_state.status == "won":
         st.success(
@@ -140,7 +207,10 @@ if st.session_state.status != "playing":
             f"Game over -- the secret was {st.session_state.secret}. "
             "Click New Game 🔁 to try again."
         )
+    render_round_summary()
     render_status()  # fill the reserved slots before bailing out of the script
+    render_sidebar_history()
+    render_sidebar_high_scores()
     st.stop()
 
 if submit:
@@ -152,6 +222,9 @@ if submit:
     if not ok:
         st.error(err)
     else:
+        previous_guess = (
+            st.session_state.history[-1] if st.session_state.history else None
+        )
         st.session_state.attempts += 1
         st.session_state.history.append(guess_int)
 
@@ -164,6 +237,22 @@ if submit:
 
         if show_hint:
             st.warning(hint_message(outcome))
+
+            # Hot/Cold feedback: the direction hint says which way to move, the
+            # proximity label says how far there is left to go, and the trend
+            # says whether the last guess was an improvement.
+            if outcome != WIN:
+                trend = proximity_trend(
+                    previous_guess, guess_int, st.session_state.secret
+                )
+                trend_text = {
+                    "warmer": " (warmer than your last guess 🔺)",
+                    "colder": " (colder than your last guess 🔻)",
+                    "same": " (same distance as your last guess ➡️)",
+                    "": "",
+                }[trend]
+                label = proximity_label(guess_int, st.session_state.secret, low, high)
+                st.info(f"{label}{trend_text}")
 
         st.session_state.score = update_score(
             current_score=st.session_state.score,
@@ -180,6 +269,19 @@ if submit:
                 f"The secret was {st.session_state.secret}. "
                 f"Final score: {st.session_state.score}"
             )
+
+            # High score tracking: only a win sets a record.
+            previous_best = st.session_state.high_scores.get(difficulty)
+            st.session_state.high_scores = update_high_scores(
+                st.session_state.high_scores,
+                difficulty,
+                st.session_state.score,
+                st.session_state.attempts,
+            )
+            if st.session_state.high_scores.get(difficulty) != previous_best:
+                st.success(f"🏆 New {difficulty} high score!")
+
+            render_round_summary()
         else:
             remaining = max(0, attempt_limit - st.session_state.attempts)
             if remaining == 0:
@@ -188,13 +290,13 @@ if submit:
                     f"Out of attempts! The secret was {st.session_state.secret}. "
                     f"Score: {st.session_state.score}"
                 )
-
-        if outcome in (TOO_HIGH, TOO_LOW) and st.session_state.history:
-            st.caption(f"Your guesses so far: {st.session_state.history}")
+                render_round_summary()
 
 # Rendered last on purpose: by this point this run's guess has been counted, so
 # the numbers shown are the real current ones rather than last run's.
 render_status()
+render_sidebar_history()
+render_sidebar_high_scores()
 
 st.divider()
 st.caption("Rebuilt by a human who read the diff.")

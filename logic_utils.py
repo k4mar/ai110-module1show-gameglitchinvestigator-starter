@@ -51,7 +51,9 @@ def get_range_for_difficulty(difficulty: str):
     Unknown difficulties fall back to Normal rather than raising, because the
     value arrives from a UI widget and a crash there would take the page down.
     """
-    low, high, _attempts = DIFFICULTIES.get(difficulty, DIFFICULTIES[DEFAULT_DIFFICULTY])
+    low, high, _attempts = DIFFICULTIES.get(
+        difficulty, DIFFICULTIES[DEFAULT_DIFFICULTY]
+    )
     return low, high
 
 
@@ -62,7 +64,9 @@ def get_attempt_limit(difficulty: str) -> int:
     # screen away from get_range_for_difficulty, so the range and the attempt
     # budget could drift apart unnoticed. They are one table now.
     """
-    _low, _high, attempts = DIFFICULTIES.get(difficulty, DIFFICULTIES[DEFAULT_DIFFICULTY])
+    _low, _high, attempts = DIFFICULTIES.get(
+        difficulty, DIFFICULTIES[DEFAULT_DIFFICULTY]
+    )
     return attempts
 
 
@@ -208,3 +212,174 @@ def update_score(current_score: int, outcome: str, attempt_number: int) -> int:
     # Unknown outcome (e.g. invalid input that never reached check_guess):
     # leave the score alone rather than guessing.
     return current_score
+
+
+# ---------------------------------------------------------------------------
+# Hot/Cold proximity feedback  (stretch feature: Enhanced Game UI)
+# ---------------------------------------------------------------------------
+
+# Bands are expressed as a fraction of the difficulty's full range, not as
+# absolute distances, so "Hot" means the same thing on Easy (1-20) as it does
+# on Hard (1-200). Ordered nearest-first; the first band whose threshold the
+# guess falls within wins.
+PROXIMITY_BANDS = (
+    (0.00, "🎯 Bullseye"),
+    (0.05, "🔥 Blazing hot"),
+    (0.15, "♨️ Hot"),
+    (0.30, "🌤️ Warm"),
+    (0.50, "🧊 Cold"),
+)
+FREEZING_LABEL = "❄️ Freezing"
+
+
+def proximity_label(guess, secret, low: int, high: int) -> str:
+    """Return a Hot/Cold label describing how near a guess is to the secret.
+
+    The distance is normalised against the width of the playing range, so the
+    labels mean the same thing at every difficulty: a guess 10 away is "Hot" on
+    Hard (1-200) but "Cold" on Easy (1-20), which is the intuition a player
+    actually has.
+
+    Args:
+        guess: The player's guess.
+        secret: The number being guessed.
+        low: Inclusive lower bound of the current difficulty's range.
+        high: Inclusive upper bound of the current difficulty's range.
+
+    Returns:
+        A short emoji-prefixed label, e.g. ``"♨️ Hot"``.
+    """
+    guess_int = _to_int(guess, "guess")
+    secret_int = _to_int(secret, "secret")
+
+    span = max(1, high - low)
+    distance_fraction = abs(guess_int - secret_int) / span
+
+    for threshold, label in PROXIMITY_BANDS:
+        if distance_fraction <= threshold:
+            return label
+    return FREEZING_LABEL
+
+
+def proximity_trend(previous_guess, guess, secret) -> str:
+    """Say whether this guess moved nearer to or further from the secret.
+
+    Args:
+        previous_guess: The guess before this one, or ``None`` on the first
+            guess of a round.
+        guess: The guess just played.
+        secret: The number being guessed.
+
+    Returns:
+        ``"warmer"``, ``"colder"``, ``"same"``, or ``""`` when there is no
+        previous guess to compare against.
+    """
+    if previous_guess is None:
+        return ""
+
+    secret_int = _to_int(secret, "secret")
+    before = abs(_to_int(previous_guess, "previous_guess") - secret_int)
+    after = abs(_to_int(guess, "guess") - secret_int)
+
+    if after < before:
+        return "warmer"
+    if after > before:
+        return "colder"
+    return "same"
+
+
+def build_session_table(history, secret, low: int, high: int):
+    """Build a row-per-guess summary of a round, for display as a table.
+
+    Args:
+        history: The guesses played this round, oldest first.
+        secret: The number being guessed.
+        low: Inclusive lower bound of the current difficulty's range.
+        high: Inclusive upper bound of the current difficulty's range.
+
+    Returns:
+        A list of dicts with the keys ``#``, ``Guess``, ``Result``, ``Off by``
+        and ``Proximity`` -- one per guess, in the order they were played.
+    """
+    rows = []
+    for index, guess in enumerate(history, start=1):
+        outcome = check_guess(guess, secret)
+        rows.append(
+            {
+                "#": index,
+                "Guess": guess,
+                "Result": outcome,
+                "Off by": abs(_to_int(guess, "guess") - _to_int(secret, "secret")),
+                "Proximity": proximity_label(guess, secret, low, high),
+            }
+        )
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# High score tracking  (stretch feature: Feature Expansion via Agent Mode)
+# ---------------------------------------------------------------------------
+
+
+def update_high_scores(high_scores, difficulty: str, score: int, attempts: int):
+    """Return a new high-score table with this result folded in.
+
+    A result beats the stored record if it scored more points, or if it matched
+    the points in fewer attempts. Ties that are no better are ignored, so the
+    stored record is always the player's genuine best.
+
+    The input mapping is never mutated -- a new dict is returned. That keeps the
+    function pure and testable, and avoids the aliasing bugs that come from
+    editing a dict that lives in Streamlit's session state.
+
+    Args:
+        high_scores: Existing records, mapping difficulty name to a dict with
+            ``score`` and ``attempts`` keys. May be ``None`` or empty.
+        difficulty: The difficulty this result was played on.
+        score: The final score achieved.
+        attempts: How many guesses the round took.
+
+    Returns:
+        A new mapping of difficulty name to ``{"score": int, "attempts": int}``.
+    """
+    updated = dict(high_scores or {})
+    previous = updated.get(difficulty)
+
+    if previous is None:
+        updated[difficulty] = {"score": score, "attempts": attempts}
+        return updated
+
+    beats_on_points = score > previous["score"]
+    ties_but_faster = score == previous["score"] and attempts < previous["attempts"]
+
+    if beats_on_points or ties_but_faster:
+        updated[difficulty] = {"score": score, "attempts": attempts}
+
+    return updated
+
+
+def format_high_scores(high_scores):
+    """Format the high-score table for display, best difficulty first.
+
+    Args:
+        high_scores: Mapping of difficulty name to a dict with ``score`` and
+            ``attempts`` keys. May be ``None`` or empty.
+
+    Returns:
+        A list of dicts with the keys ``Difficulty``, ``Best score`` and
+        ``Attempts``, sorted by score descending. Empty when no rounds have
+        been completed yet.
+    """
+    if not high_scores:
+        return []
+
+    rows = [
+        {
+            "Difficulty": difficulty,
+            "Best score": record["score"],
+            "Attempts": record["attempts"],
+        }
+        for difficulty, record in high_scores.items()
+    ]
+    rows.sort(key=lambda row: (-row["Best score"], row["Attempts"]))
+    return rows
