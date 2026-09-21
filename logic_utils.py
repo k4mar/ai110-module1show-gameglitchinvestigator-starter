@@ -1,26 +1,210 @@
+"""Pure game logic for the number-guessing game.
+
+Everything in here is deliberately free of Streamlit imports so it can be
+imported and unit tested without booting a web server. `app.py` owns the UI and
+session state; this module owns the rules.
+
+# FIX: All four functions were refactored out of app.py with Claude Code in
+# agent mode. I asked it to move the functions, fix the inverted hints and the
+# string-comparison bug, and update the imports in app.py in one pass, then
+# reviewed the diff function by function before keeping it.
+"""
+
+import math
+
+# Outcome constants. app.py used bare string literals in five different places,
+# which is how "Too High" ended up paired with "go HIGHER" -- a typo in any one
+# of them failed silently. Naming them means a typo is an AttributeError.
+WIN = "Win"
+TOO_HIGH = "Too High"
+TOO_LOW = "Too Low"
+
+# Scoring knobs, named so the numbers are not magic.
+MAX_WIN_POINTS = 100
+MIN_WIN_POINTS = 10
+POINTS_LOST_PER_ATTEMPT = 10
+WRONG_GUESS_PENALTY = 5
+
+# (low, high, attempts) per difficulty.
+#
+# # FIX: "Hard" used to be 1-50, a NARROWER range than "Normal" (1-100), so
+# Hard was the easiest setting in the game. Hard is now the widest range.
+#
+# The attempt budget for each row must be at least ceil(log2(number of
+# possibilities)), otherwise the difficulty is unwinnable even with perfect
+# binary-search play. Easy needs 5 and gets 6, Normal needs 7 and gets 8, Hard
+# needs 8 and gets 8. `test_every_difficulty_is_winnable_by_binary_search`
+# enforces that so a future tweak to this table cannot quietly ship an
+# impossible difficulty.
+DIFFICULTIES = {
+    "Easy": (1, 20, 6),
+    "Normal": (1, 100, 8),
+    "Hard": (1, 200, 8),
+}
+
+DEFAULT_DIFFICULTY = "Normal"
+
+
 def get_range_for_difficulty(difficulty: str):
-    """Return (low, high) inclusive range for a given difficulty."""
-    raise NotImplementedError("Refactor this function from app.py into logic_utils.py")
+    """Return the (low, high) inclusive guessing range for a difficulty.
 
-
-def parse_guess(raw: str):
+    Unknown difficulties fall back to Normal rather than raising, because the
+    value arrives from a UI widget and a crash there would take the page down.
     """
-    Parse user input into an int guess.
+    low, high, _attempts = DIFFICULTIES.get(difficulty, DIFFICULTIES[DEFAULT_DIFFICULTY])
+    return low, high
 
-    Returns: (ok: bool, guess_int: int | None, error_message: str | None)
+
+def get_attempt_limit(difficulty: str) -> int:
+    """Return how many guesses a difficulty allows.
+
+    # FIX: this lived as a bare `attempt_limit_map` dict inside app.py, one
+    # screen away from get_range_for_difficulty, so the range and the attempt
+    # budget could drift apart unnoticed. They are one table now.
     """
-    raise NotImplementedError("Refactor this function from app.py into logic_utils.py")
+    _low, _high, attempts = DIFFICULTIES.get(difficulty, DIFFICULTIES[DEFAULT_DIFFICULTY])
+    return attempts
+
+
+def minimum_attempts_needed(low: int, high: int) -> int:
+    """Guesses a perfect binary search needs to pin any number in [low, high]."""
+    possibilities = high - low + 1
+    if possibilities <= 1:
+        return 1
+    return math.ceil(math.log2(possibilities))
+
+
+def parse_guess(raw, low=None, high=None):
+    """Parse raw text input into an integer guess.
+
+    Returns ``(ok, guess_int, error_message)``. When ``low`` and ``high`` are
+    supplied, guesses outside the range are rejected with an explanation.
+
+    # FIX: the original accepted "3.9" and silently truncated it to 3 via
+    # int(float(raw)), so the game scored you against a number you never
+    # guessed. Whole-number decimals like "42.0" are still accepted, but a
+    # fractional guess is now an explicit error instead of a silent rewrite.
+    #
+    # The .strip() is here because the original only tested `raw == ""`, so
+    # whitespace-only input fell through to int("   ") and reported "That is
+    # not a number." instead of "Enter a guess.". (I first assumed it was
+    # needed because " 42" failed to parse -- it did not. Python's int()
+    # already strips surrounding whitespace. See reflection.md section 2.)
+    """
+    if raw is None:
+        return False, None, "Enter a guess."
+
+    text = str(raw).strip()
+    if text == "":
+        return False, None, "Enter a guess."
+
+    try:
+        if "." in text or "e" in text.lower():
+            as_float = float(text)
+            # Guard against inf/nan: float("1e999") is inf, and int(inf) raises
+            # OverflowError, which would crash the app rather than show an
+            # error. Found while writing test_absurdly_large_input_is_rejected.
+            if math.isinf(as_float) or math.isnan(as_float):
+                return False, None, "That is not a number."
+            if as_float != int(as_float):
+                return False, None, "Whole numbers only -- no decimals."
+            value = int(as_float)
+        else:
+            value = int(text)
+    except ValueError:
+        return False, None, "That is not a number."
+
+    if low is not None and high is not None and not (low <= value <= high):
+        return False, None, f"Out of range. Guess between {low} and {high}."
+
+    return True, value, None
+
+
+def _to_int(value, name):
+    """Coerce a guess/secret to int, refusing anything not numeric.
+
+    # FIX: the original check_guess wrapped its comparison in a bare
+    # `except TypeError` that fell back to comparing str(guess) against the
+    # secret. That turned a real type error into a LEXICOGRAPHIC comparison --
+    # "9" > "50" is True -- which is exactly why the hints lied. Bad types now
+    # raise loudly instead of producing a confident wrong answer.
+    """
+    if isinstance(value, bool):
+        raise TypeError(f"{name} must be a number, got bool: {value!r}")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if value != int(value):
+            raise TypeError(f"{name} must be a whole number, got {value!r}")
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            raise TypeError(f"{name} must be a number, got {value!r}") from None
+    raise TypeError(f"{name} must be a number, got {type(value).__name__}: {value!r}")
 
 
 def check_guess(guess, secret):
+    """Compare a guess to the secret and return the outcome.
+
+    Returns one of the ``WIN`` / ``TOO_HIGH`` / ``TOO_LOW`` constants. Use
+    :func:`hint_message` to turn an outcome into player-facing text.
+
+    # FIX: this used to return an (outcome, message) tuple, which mixed the
+    # rule with its presentation and let them disagree -- TOO_HIGH shipped
+    # paired with "Go HIGHER!". Splitting them means the hint text is derived
+    # from the outcome instead of hand-written next to it, so they cannot drift
+    # apart again. It also matches what the starter tests already asserted.
     """
-    Compare guess to secret and return (outcome, message).
+    guess_int = _to_int(guess, "guess")
+    secret_int = _to_int(secret, "secret")
 
-    outcome examples: "Win", "Too High", "Too Low"
+    if guess_int == secret_int:
+        return WIN
+    if guess_int > secret_int:
+        return TOO_HIGH
+    return TOO_LOW
+
+
+def hint_message(outcome: str) -> str:
+    """Player-facing hint for an outcome.
+
+    # FIX: the advice is now looked up from the outcome, so "Too High" can only
+    # ever tell the player to go LOWER. This is the actual inverted-hint fix.
     """
-    raise NotImplementedError("Refactor this function from app.py into logic_utils.py")
+    return {
+        WIN: "🎉 Correct!",
+        TOO_HIGH: "📉 Too high -- go LOWER!",
+        TOO_LOW: "📈 Too low -- go HIGHER!",
+    }.get(outcome, "")
 
 
-def update_score(current_score: int, outcome: str, attempt_number: int):
-    """Update score based on outcome and attempt number."""
-    raise NotImplementedError("Refactor this function from app.py into logic_utils.py")
+def update_score(current_score: int, outcome: str, attempt_number: int) -> int:
+    """Return the new score after one guess.
+
+    ``attempt_number`` is the 1-based number of the attempt just played, so a
+    win on the very first guess is worth the full ``MAX_WIN_POINTS``.
+
+    # FIX: three bugs here.
+    # 1. "Too High" paid +5 on even attempts and -5 on odd ones, so the reward
+    #    depended on WHEN you guessed rather than WHAT you guessed. Both wrong
+    #    outcomes now cost the same fixed penalty.
+    # 2. Nothing clamped the total, so four honest wrong guesses left the score
+    #    at -20. The floor is 0.
+    # 3. The win bonus was 100 - 10 * (attempt_number + 1), but app.py had
+    #    already incremented attempts before calling, so a first-guess win paid
+    #    80 instead of 100 -- an off-by-two.
+    """
+    if outcome == WIN:
+        attempts_used = max(1, attempt_number)
+        points = MAX_WIN_POINTS - POINTS_LOST_PER_ATTEMPT * (attempts_used - 1)
+        points = max(MIN_WIN_POINTS, points)
+        return current_score + points
+
+    if outcome in (TOO_HIGH, TOO_LOW):
+        return max(0, current_score - WRONG_GUESS_PENALTY)
+
+    # Unknown outcome (e.g. invalid input that never reached check_guess):
+    # leave the score alone rather than guessing.
+    return current_score
